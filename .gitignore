@@ -1,0 +1,6 @@
+examples
+.github
+data
+node_modules
+test
+.env
