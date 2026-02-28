@@ -3,7 +3,7 @@ const path = require('path');
 
 class Logger {
   constructor() {
-    this.logLevel = process.env.LOG_LEVEL || 'info';
+    this.logLevel = process.env.LOG_LEVEL || 'warn';
     this.logToFile = process.env.LOG_TO_FILE === 'true';
     this.logFilePath = process.env.LOG_FILE_PATH || './logs/server.log';
     

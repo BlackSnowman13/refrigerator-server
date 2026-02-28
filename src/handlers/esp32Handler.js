@@ -26,9 +26,7 @@ class ESP32Handler {
 
   async handleRegistration(socket, data) {
     try {
-      logger.info('ESP32 registration attempt:', data);
       const { serialNumber, authKey, deviceInfo } = data;
-      console.log('Received registration data:', data);
 
       if (!serialNumber) {
         logger.error('Registration failed: Missing serial number');
@@ -36,8 +34,6 @@ class ESP32Handler {
         await this.database.logConnection('esp32', 'unknown', 'auth_failure', 'Missing serial number');
         return;
       }
-
-      logger.info(`Processing registration for ESP32: ${serialNumber}`);
 
       // Authenticate ESP32
       if (this.authEnabled && !await this.authenticateESP32(serialNumber, authKey)) {
@@ -120,10 +116,8 @@ class ESP32Handler {
   }
 
   sendMessage(socket, message) {
-    logger.info('Sending message to ESP32:', message);
     if (socket.readyState === 1) { // WebSocket.OPEN = 1
       socket.send(JSON.stringify(message));
-      logger.info('Message sent successfully');
     } else {
       logger.error(`Cannot send message, WebSocket state: ${socket.readyState}`);
     }
@@ -168,12 +162,6 @@ class ESP32Handler {
       const device = this.connectedDevices.get(serialNumber);
       device.lastHeartbeat = Date.now();
 
-      if (sensorData.requestId) {
-        logger.debug(`Sensor data response received from ESP32 ${serialNumber} for request ${sensorData.requestId}:`, sensorData);
-      } else {
-        logger.debug(`Periodic sensor data received from ESP32 ${serialNumber}:`, sensorData);
-      }
-
     } catch (error) {
       logger.error('Error handling sensor data:', error);
       this.sendMessage(socket, { type: 'esp32:error', error: 'Data processing failed' });
@@ -187,7 +175,6 @@ class ESP32Handler {
       const device = this.connectedDevices.get(serialNumber);
       device.lastHeartbeat = Date.now();
       this.sendMessage(socket, { type: 'esp32:heartbeat_ack' });
-      logger.debug(`Heartbeat received from registered ESP32: ${serialNumber}`);
     } else {
       // Handle unregistered heartbeat - request re-registration
       logger.warn(`Received heartbeat from unregistered socket. Socket serial: ${serialNumber || 'undefined'}. Requesting re-registration.`);
@@ -322,24 +309,21 @@ class ESP32Handler {
     return device ? device.socket : null;
   }
 
-  // Debug methods
   logConnectedDevicesState() {
-    logger.info('=== ESP32 CONNECTED DEVICES STATE ===');
-    logger.info(`Total connected devices: ${this.connectedDevices.size}`);
+    logger.info(`ESP32 connected devices: ${this.connectedDevices.size}`);
     
     if (this.connectedDevices.size === 0) {
-      logger.info('No ESP32 devices currently connected');
+      logger.info('No ESP32 devices connected');
     } else {
       for (const [serialNumber, device] of this.connectedDevices.entries()) {
-        logger.info(`Device: ${serialNumber}`);
-        logger.info(`  - Socket ready state: ${device.socket.readyState}`);
-        logger.info(`  - Last heartbeat: ${new Date(device.lastHeartbeat).toISOString()}`);
-        logger.info(`  - Device info: ${JSON.stringify(device.deviceInfo)}`);
-        logger.info(`  - Client interval preference: ${this.deviceIntervals.get(serialNumber)}ms`);
-        logger.info(`  - Data collection: On-demand only (no automatic polling)`);
+        logger.info(`ESP32 ${serialNumber} state`, {
+          socketReadyState: device.socket.readyState,
+          lastHeartbeat: new Date(device.lastHeartbeat).toISOString(),
+          deviceInfo: device.deviceInfo,
+          intervalMs: this.deviceIntervals.get(serialNumber)
+        });
       }
     }
-    logger.info('=== END ESP32 STATE ===');
   }
 }
 

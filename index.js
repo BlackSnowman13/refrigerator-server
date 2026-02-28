@@ -77,7 +77,7 @@ class RefrigeratorServer {
 
   setupSocketHandlers() {
     this.wss.on('connection', (ws, req) => {
-      logger.info(`New WebSocket connection from: ${req.socket.remoteAddress}`);
+      logger.info(`WebSocket connected from ${req.socket.remoteAddress}`);
       
       // Add unique ID to websocket
       ws.id = Math.random().toString(36).substr(2, 9);
@@ -97,13 +97,13 @@ class RefrigeratorServer {
           const data = JSON.parse(message.toString());
           this.handleMessage(ws, data);
         } catch (error) {
-          logger.error('Invalid JSON received:', error);
+          logger.warn('Invalid JSON payload received');
           ws.send(JSON.stringify({ type: 'error', error: 'Invalid JSON format' }));
         }
       });
 
       ws.on('close', () => {
-        logger.info(`WebSocket connection closed: ${ws.id}`);
+        logger.info(`WebSocket closed: ${ws.id}`);
         this.esp32Handler.handleDisconnection(ws);
         this.clientHandler.handleDisconnection(ws);
       });
@@ -119,7 +119,7 @@ class RefrigeratorServer {
       this.wss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
           // Connection didn't respond to previous ping - terminate it
-          logger.info(`WebSocket ${ws.id} failed to respond to ping, terminating`);
+          logger.warn(`WebSocket ${ws.id} did not respond to ping; terminating`);
           return ws.terminate();
         }
         
@@ -132,12 +132,9 @@ class RefrigeratorServer {
 
   handleMessage(ws, data) {
     const { type, ...payload } = data;
-    logger.info(`=== MESSAGE RECEIVED ===`);
-    logger.info(`WebSocket ID: ${ws.id}, Type: ${type}`, payload);
     
     switch(type) {
       case 'esp32:register':
-        logger.info('Routing to ESP32 registration handler');
         this.esp32Handler.handleRegistration(ws, payload);
         break;
       case 'esp32:data':
@@ -147,7 +144,6 @@ class RefrigeratorServer {
         this.esp32Handler.handleHeartbeat(ws, payload);
         break;
       case 'client:subscribe':
-        logger.info('Routing to client subscription handler');
         this.clientHandler.handleSubscription(ws, payload);
         break;
       case 'client:unsubscribe':
@@ -160,7 +156,6 @@ class RefrigeratorServer {
         logger.warn(`Unknown message type: ${type}`);
         ws.send(JSON.stringify({ type: 'error', error: 'Unknown message type' }));
     }
-    logger.info(`=== MESSAGE PROCESSING COMPLETE ===`);
   }
 
   async start() {

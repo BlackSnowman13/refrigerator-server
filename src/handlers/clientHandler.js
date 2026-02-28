@@ -63,14 +63,8 @@ class ClientHandler {
 
   async handleSubscription(socket, data) {
     try {
-      logger.info('=== SUBSCRIPTION REQUEST START ===');
-      logger.info('Received data:', JSON.stringify(data, null, 2));
-      
       const { serialNumbers } = data;
       const clientId = socket.id;
-      
-      logger.info(`Client ${clientId} attempting to subscribe to:`, serialNumbers);
-      logger.info(`Socket ID: ${clientId}, Socket readyState: ${socket.readyState}`);
 
       if (!Array.isArray(serialNumbers)) {
         this.sendMessage(socket, { type: 'client:error', error: 'Invalid serialNumbers format - must be array' });
@@ -103,9 +97,6 @@ class ClientHandler {
       const invalidSerialNumbers = [];
       const connectedDevices = this.esp32Handler.getConnectedDevices().map(d => d.serialNumber);
       
-      logger.info(`Currently connected ESP32 devices: [${connectedDevices.join(', ')}]`);
-      logger.info(`Total connected devices count: ${connectedDevices.length}`);
-      
       // Log detailed ESP32 state for debugging if no devices are connected
       if (connectedDevices.length === 0) {
         this.esp32Handler.logConnectedDevicesState();
@@ -114,7 +105,6 @@ class ClientHandler {
       for (const serialNumber of serialNumbers) {
         if (this.esp32Handler.isDeviceConnected(serialNumber)) {
           validSerialNumbers.push(serialNumber);
-          logger.debug(`ESP32 ${serialNumber} is connected and available for subscription`);
         } else {
           invalidSerialNumbers.push(serialNumber);
           logger.warn(`ESP32 ${serialNumber} is NOT connected or not available for subscription`);
@@ -151,9 +141,6 @@ class ClientHandler {
             serialNumber,
             success: true
           });
-
-          // Track subscription (no socket.join needed for WebSocket)
-          logger.debug(`Client ${clientId} subscribed to ESP32 ${serialNumber}`);
         }
       }
 
@@ -178,11 +165,8 @@ class ClientHandler {
         totalSubscriptions: finalClient.subscriptions.size
       });
 
-      logger.info('=== SUBSCRIPTION REQUEST END ===');
-
     } catch (error) {
       logger.error('Client subscription error:', error);
-      logger.error('=== SUBSCRIPTION REQUEST FAILED ===');
       this.sendMessage(socket, { type: 'client:error', error: 'Subscription failed' });
     }
   }
@@ -334,7 +318,7 @@ class ClientHandler {
 
       client.lastActivity = Date.now();
 
-      logger.info(`Command ${command} completed for client ${clientId}:`, commandResult);
+      logger.info(`Command ${command} completed for client ${clientId}`);
 
     } catch (error) {
       logger.error('Client command error:', error);
@@ -633,13 +617,6 @@ class ClientHandler {
           timestamp: new Date().toISOString()
         });
         
-        if (request.commandType === 'write_register') {
-          logger.debug(`Sent write response from ESP32 ${serialNumber} to client ${request.clientId}`);
-        } else if (request.commandType === 'write_multiple_registers') {
-          logger.debug(`Sent multiple write response from ESP32 ${serialNumber} to client ${request.clientId}`);
-        } else {
-          logger.debug(`Sent requested data from ESP32 ${serialNumber} to specific client ${request.clientId}`);
-        }
       }
       
       // Clean up the request
@@ -656,7 +633,6 @@ class ClientHandler {
           });
         }
       }
-      logger.debug(`Broadcast periodic sensor data from ESP32 ${serialNumber} to subscribed clients`);
     }
   }
 
@@ -665,7 +641,6 @@ class ClientHandler {
     const now = Date.now();
     for (const [requestId, request] of this.pendingDataRequests.entries()) {
       if (now - request.requestTime > this.requestTimeout) {
-        logger.debug(`Cleaning up expired data request: ${requestId}`);
         this.pendingDataRequests.delete(requestId);
       }
     }
