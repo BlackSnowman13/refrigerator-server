@@ -9,6 +9,7 @@ const path = require('path');
 const Database = require('./src/database/database');
 const ESP32Handler = require('./src/handlers/esp32Handler');
 const ClientHandler = require('./src/handlers/clientHandler');
+const otaService = require('./src/utils/otaService');
 const logger = require('./src/utils/logger');
 
 class RefrigeratorServer {
@@ -71,6 +72,59 @@ class RefrigeratorServer {
       } catch (error) {
         logger.error('Error fetching sensor history:', error);
         res.status(500).json({ error: 'Failed to fetch sensor history' });
+      }
+    });
+
+    // OTA Firmware Update Endpoints
+    this.app.get('/api/firmware/check', async (req, res) => {
+      try {
+        const { serial, refresh } = req.query;
+        const devices = this.esp32Handler.getConnectedDevices();
+        const targetDevice = serial
+          ? devices.find((d) => d.serialNumber === serial)
+          : devices[0];
+
+        const currentVersion =
+          req.query.currentVersion ||
+          targetDevice?.deviceInfo?.firmwareVersion ||
+          'unknown';
+
+        const status = await otaService.checkUpdateForVersion(
+          currentVersion,
+          refresh === 'true'
+        );
+
+        res.json({
+          serialNumber: targetDevice?.serialNumber || serial || null,
+          ...status
+        });
+      } catch (error) {
+        logger.error('Error checking firmware update:', error);
+        res.status(500).json({ error: error.message || 'Failed to check firmware update' });
+      }
+    });
+
+    this.app.get('/api/firmware/download', async (req, res) => {
+      try {
+        logger.info(`Firmware download requested by ${req.socket.remoteAddress}`);
+        await otaService.streamLatestBinary(res);
+      } catch (error) {
+        logger.error('Error downloading firmware binary:', error);
+        if (!res.headersSent) {
+          res.status(500).json({ error: error.message || 'Failed to download firmware binary' });
+        }
+      }
+    });
+
+    this.app.post('/api/esp32/:serial/ota', async (req, res) => {
+      try {
+        const { serial } = req.params;
+        const { url } = req.body || {};
+        const result = await this.clientHandler.handleOTAUpdateCommand(serial, { url });
+        res.status(result.success ? 200 : 400).json(result);
+      } catch (error) {
+        logger.error('Error triggering OTA update:', error);
+        res.status(500).json({ error: error.message || 'Failed to trigger OTA update' });
       }
     });
   }
@@ -142,6 +196,10 @@ class RefrigeratorServer {
         break;
       case 'esp32:heartbeat':
         this.esp32Handler.handleHeartbeat(ws, payload);
+        break;
+      case 'esp32:command_response':
+      case 'esp32:status':
+        this.esp32Handler.handleCommandResponse(ws, data);
         break;
       case 'client:subscribe':
         this.clientHandler.handleSubscription(ws, payload);

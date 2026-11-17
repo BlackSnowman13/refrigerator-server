@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const otaService = require('../utils/otaService');
 
 class ClientHandler {
   constructor(wss, database, esp32Handler) {
@@ -302,6 +303,14 @@ class ClientHandler {
         case 'get_status':
           commandResult = await this.handleStatusCommand(serialNumber, parameters);
           break;
+
+        case 'check_ota_update':
+          commandResult = await this.handleCheckOTACommand(serialNumber, parameters);
+          break;
+
+        case 'ota_update':
+          commandResult = await this.handleOTAUpdateCommand(serialNumber, parameters);
+          break;
           
         default:
           // Forward custom command to ESP32
@@ -530,8 +539,54 @@ class ClientHandler {
         connected: true,
         lastHeartbeat: device.lastHeartbeat,
         dataInterval: device.dataInterval,
-        deviceInfo: device.deviceInfo
+        deviceInfo: device.deviceInfo,
+        otaStatus: device.otaStatus || null
       }
+    };
+  }
+
+  async handleCheckOTACommand(targetESP32, parameters = {}) {
+    try {
+      const device = this.esp32Handler.getConnectedDevices().find(d => d.serialNumber === targetESP32);
+      const currentVersion = device?.deviceInfo?.firmwareVersion || 'unknown';
+      const otaStatus = await otaService.checkUpdateForVersion(currentVersion, Boolean(parameters?.refresh));
+      return {
+        success: true,
+        ...otaStatus
+      };
+    } catch (error) {
+      logger.error('Failed to check OTA update:', error);
+      return {
+        success: false,
+        error: error.message || 'Failed to check GitHub releases'
+      };
+    }
+  }
+
+  async handleOTAUpdateCommand(targetESP32, parameters = {}) {
+    const esp32Socket = this.esp32Handler.getDeviceSocket(targetESP32);
+    if (!esp32Socket) {
+      return { success: false, error: 'ESP32 socket not available' };
+    }
+
+    const requestId = `ota_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    const payload = {
+      type: 'esp32:command',
+      command: 'ota_update',
+      requestId,
+      timestamp: new Date().toISOString()
+    };
+
+    if (parameters && parameters.url) {
+      payload.url = parameters.url;
+    }
+
+    this.esp32Handler.sendMessage(esp32Socket, payload);
+
+    return {
+      success: true,
+      message: 'Autonomous OTA update triggered on ESP32 (rebooting into factory updater)',
+      requestId
     };
   }
 

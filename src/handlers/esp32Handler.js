@@ -1,4 +1,5 @@
 const logger = require('../utils/logger');
+const otaService = require('../utils/otaService');
 
 class ESP32Handler {
   constructor(wss, database) {
@@ -113,6 +114,27 @@ class ESP32Handler {
 
     // Notify clients about new ESP32 connection
     this.notifyClientsDeviceStatusChange(serialNumber, 'connected');
+
+    // Automatically check for OTA updates in the background when ESP32 connects
+    if (process.env.GITHUB_TOKEN) {
+      otaService
+        .checkUpdateForVersion(deviceInfo?.firmwareVersion)
+        .then((otaStatus) => {
+          const dev = this.connectedDevices.get(serialNumber);
+          if (dev) {
+            dev.otaStatus = otaStatus;
+          }
+          this.broadcastToClients({
+            type: 'esp32:ota_status',
+            serialNumber,
+            ...otaStatus,
+            timestamp: new Date().toISOString()
+          });
+        })
+        .catch((err) => {
+          logger.warn(`Auto OTA check failed for ${serialNumber}: ${err.message}`);
+        });
+    }
   }
 
   sendMessage(socket, message) {
@@ -183,6 +205,22 @@ class ESP32Handler {
         error: 'Device not registered. Please send registration message.' 
       });
     }
+  }
+
+  handleCommandResponse(socket, data) {
+    const serialNumber = socket.esp32SerialNumber || data.serialNumber;
+    if (!serialNumber) return;
+
+    if (this.connectedDevices.has(serialNumber)) {
+      const device = this.connectedDevices.get(serialNumber);
+      device.lastHeartbeat = Date.now();
+    }
+
+    this.broadcastToClients({
+      ...data,
+      serialNumber,
+      timestamp: data.timestamp || new Date().toISOString()
+    });
   }
 
   async handleDisconnection(socket) {
@@ -291,6 +329,7 @@ class ESP32Handler {
     return Array.from(this.connectedDevices.entries()).map(([serialNumber, device]) => ({
       serialNumber,
       deviceInfo: device.deviceInfo,
+      otaStatus: device.otaStatus || null,
       lastHeartbeat: device.lastHeartbeat,
       dataInterval: this.deviceIntervals.get(serialNumber)
     }));
