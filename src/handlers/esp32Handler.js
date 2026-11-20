@@ -17,6 +17,7 @@ class ESP32Handler {
     
     // Heartbeat monitoring
     this.heartbeatTimeout = parseInt(process.env.CONNECTION_TIMEOUT) || 30000;
+    this.chunkBuffers = new Map(); // Map<requestId_or_serial, {mergedData, basePayload, timer}>
     this.startHeartbeatMonitoring();
   }
 
@@ -129,7 +130,7 @@ class ESP32Handler {
             serialNumber,
             ...otaStatus,
             timestamp: new Date().toISOString()
-          });
+          }, serialNumber);
         })
         .catch((err) => {
           logger.warn(`Auto OTA check failed for ${serialNumber}: ${err.message}`);
@@ -165,6 +166,14 @@ class ESP32Handler {
         return;
       }
 
+      // Update last activity immediately (even if chunk is empty)
+      const device = this.connectedDevices.get(serialNumber);
+      device.lastHeartbeat = Date.now();
+
+      const isChunked = typeof data.chunk_number === 'number' && typeof data.total_chunks === 'number';
+      const hasNestedDataObject = data.data && typeof data.data === 'object' && !Array.isArray(data.data);
+      const isDataEmpty = hasNestedDataObject && Object.keys(data.data).length === 0;
+
       // Add timestamp if not present, preserve requestId if present
       const sensorData = {
         ...data,
@@ -172,21 +181,87 @@ class ESP32Handler {
         serialNumber
       };
 
-      // Log to database (but don't log the requestId in database)
-      const dataForDb = { ...sensorData };
-      delete dataForDb.requestId;
-      this.database.logSensorData(serialNumber, dataForDb);
+      // If this is a multi-chunk response, buffer non-empty chunks for a single combined DB write
+      // and drop empty intermediate chunks from being broadcast or logged
+      if (isChunked) {
+        const bufferKey = data.requestId || `chunk_${serialNumber}`;
+
+        if (!isDataEmpty) {
+          if (!this.chunkBuffers.has(bufferKey)) {
+            const basePayload = { ...sensorData };
+            delete basePayload.requestId;
+            delete basePayload.chunk_number;
+            delete basePayload.chunk_start_reg;
+            delete basePayload.chunk_end_reg;
+            delete basePayload.chunk_size;
+            delete basePayload.is_final_chunk;
+
+            this.chunkBuffers.set(bufferKey, {
+              mergedData: {},
+              basePayload,
+              timer: setTimeout(() => {
+                this.flushChunkBuffer(serialNumber, bufferKey);
+              }, 15000)
+            });
+          }
+
+          const buf = this.chunkBuffers.get(bufferKey);
+          Object.assign(buf.mergedData, data.data);
+        }
+
+        const isFinalChunk = data.is_final_chunk === true || data.chunk_number >= data.total_chunks;
+
+        if (isFinalChunk) {
+          this.flushChunkBuffer(serialNumber, bufferKey);
+        }
+
+        // If the chunk had no registers in it and is not the final chunk, drop it completely
+        if (isDataEmpty && !isFinalChunk) {
+          return;
+        }
+
+        // If the final chunk itself is empty, we still let ClientHandler know the final chunk arrived
+        // so it can clean up pendingDataRequests, without broadcasting empty data
+        if (isDataEmpty && isFinalChunk) {
+          if (this.clientHandler && data.requestId) {
+            this.clientHandler.completeChunkedRequest(data.requestId, serialNumber);
+          }
+          return;
+        }
+      } else {
+        // Non-chunked payload: drop if data object is explicitly empty
+        if (isDataEmpty) {
+          return;
+        }
+
+        // Log to database (but don't log the requestId in database)
+        const dataForDb = { ...sensorData };
+        delete dataForDb.requestId;
+        this.database.logSensorData(serialNumber, dataForDb);
+      }
 
       // Broadcast to subscribed clients (preserving requestId for routing)
       this.broadcastDataToClients(serialNumber, sensorData);
 
-      // Update last activity
-      const device = this.connectedDevices.get(serialNumber);
-      device.lastHeartbeat = Date.now();
-
     } catch (error) {
       logger.error('Error handling sensor data:', error);
       this.sendMessage(socket, { type: 'esp32:error', error: 'Data processing failed' });
+    }
+  }
+
+  flushChunkBuffer(serialNumber, bufferKey) {
+    const buf = this.chunkBuffers.get(bufferKey);
+    if (!buf) return;
+
+    clearTimeout(buf.timer);
+    this.chunkBuffers.delete(bufferKey);
+
+    if (Object.keys(buf.mergedData).length > 0) {
+      const combinedForDb = {
+        ...buf.basePayload,
+        data: buf.mergedData
+      };
+      this.database.logSensorData(serialNumber, combinedForDb);
     }
   }
 
@@ -208,7 +283,7 @@ class ESP32Handler {
   }
 
   handleCommandResponse(socket, data) {
-    const serialNumber = socket.esp32SerialNumber || data.serialNumber;
+    const serialNumber = socket.esp32SerialNumber || data.serialNumber || data.device_id;
     if (!serialNumber) return;
 
     if (this.connectedDevices.has(serialNumber)) {
@@ -216,11 +291,12 @@ class ESP32Handler {
       device.lastHeartbeat = Date.now();
     }
 
+    // Route only to web clients subscribed to this serialNumber (never back to ESP32 sockets)
     this.broadcastToClients({
       ...data,
       serialNumber,
       timestamp: data.timestamp || new Date().toISOString()
-    });
+    }, serialNumber);
   }
 
   async handleDisconnection(socket) {
@@ -284,10 +360,18 @@ class ESP32Handler {
     }
   }
 
-  broadcastToClients(message) {
+  broadcastToClients(message, serialNumber = null) {
+    // If ClientHandler is available and a serialNumber is provided, send only to subscribers
+    if (serialNumber && this.clientHandler) {
+      this.clientHandler.broadcastMessageToSubscribers(serialNumber, message);
+      return;
+    }
+
+    // Otherwise broadcast only to web client sockets (never to ESP32 devices)
+    const serialized = JSON.stringify(message);
     this.wss.clients.forEach((client) => {
-      if (client.readyState === 1) { // WebSocket.OPEN
-        client.send(JSON.stringify(message));
+      if (client.readyState === 1 && client.connectionType !== 'esp32') { // WebSocket.OPEN
+        client.send(serialized);
       }
     });
   }

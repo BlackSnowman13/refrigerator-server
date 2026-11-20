@@ -7,12 +7,15 @@ class ClientHandler {
     this.database = database;
     this.esp32Handler = esp32Handler;
     this.connectedClients = new Map(); // Map<socket_id, {socket, subscriptions, lastActivity}>
-    this.pendingDataRequests = new Map(); // Map<requestId, {clientId, requestTime, targetESP32}>
+    this.pendingDataRequests = new Map(); // Map<requestId, {clientId, clientIds, requestTime, targetESP32, commandType, accumulatedChunks}>
+    this.inFlightReadRequests = new Map(); // Map<`${serialNumber}:${commandType}`, requestId>
+    this.dataCache = new Map(); // Map<`${serialNumber}:${commandType}`, {timestamp, chunks}>
     
     // Configuration
     this.maxESP32PerClient = parseInt(process.env.MAX_ESP32_PER_CLIENT) || 20;
     this.maxClientsPerESP32 = parseInt(process.env.MAX_CLIENTS_PER_ESP32) || 10;
     this.requestTimeout = 10000; // 10 seconds timeout for data requests
+    this.cacheTtlMs = parseInt(process.env.DATA_CACHE_TTL_MS) || 1500; // 1.5s short TTL cache for rapid polling
   }
 
   sendMessage(socket, message) {
@@ -397,13 +400,14 @@ class ClientHandler {
     // Clean up old requests (timeout cleanup)
     this.cleanupExpiredRequests();
 
-    // Send multiple write command to ESP32
-    this.esp32Handler.sendMessage(esp32Socket, {
-      type: 'esp32:write_multiple_registers',
-      registers: registers,
-      requestId: requestId,
-      timestamp: new Date().toISOString()
-    });
+      // Send multiple write command to ESP32
+      this.InvalidateDeviceCache(targetESP32);
+      this.esp32Handler.sendMessage(esp32Socket, {
+        type: 'esp32:write_multiple_registers',
+        registers: registers,
+        requestId: requestId,
+        timestamp: new Date().toISOString()
+      });
 
     return { 
       success: true, 
@@ -444,6 +448,7 @@ class ClientHandler {
     this.cleanupExpiredRequests();
 
     // Send write command to ESP32
+    this.InvalidateDeviceCache(targetESP32);
     this.esp32Handler.sendMessage(esp32Socket, {
       type: 'esp32:write_register',
       registerCode: registerCode,
@@ -461,63 +466,126 @@ class ClientHandler {
     };
   }
 
-  async handleDataRequestCommand(targetESP32, parameters, clientId) {
-    const esp32Socket = this.esp32Handler.getDeviceSocket(targetESP32);
-    
-    if (!esp32Socket) {
-      return { success: false, error: 'ESP32 socket not available' };
-    }
-
-    // Generate unique request ID and track the request
-    const requestId = `${clientId}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-    
-    // Store request tracking info
-    this.pendingDataRequests.set(requestId, {
-      clientId,
-      requestTime: Date.now(),
-      targetESP32
-    });
-
-    // Clean up old requests (timeout cleanup)
-    this.cleanupExpiredRequests();
-
-    // Request immediate data using ESP32Handler's sendMessage
-    this.esp32Handler.sendMessage(esp32Socket, {
-      type: 'esp32:command',
-      command: 'request_all_data',
-      // immediate: true,
-      requestId: requestId,
-      timestamp: new Date().toISOString()
-    });
-
-    return { success: true, message: 'Data request sent to ESP32', requestId };
+  InvalidateDeviceCache(targetESP32) {
+    this.dataCache.delete(`${targetESP32}:request_all_data`);
+    this.dataCache.delete(`${targetESP32}:request_readonly_data`);
   }
 
-    async handleReadOnlyDataRequestCommand(targetESP32, parameters, clientId) {
+  serveCachedDataToClient(clientId, targetESP32, cachedEntry) {
+    const client = this.connectedClients.get(clientId);
+    if (!client || client.socket.readyState !== 1) return null;
+
+    const syntheticRequestId = `${clientId}_cached_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+
+    // Replay cached chunks asynchronously so client receives client:command_result first
+    setImmediate(() => {
+      if (client.socket.readyState !== 1) return;
+      for (const chunkData of cachedEntry.chunks) {
+        this.sendMessage(client.socket, {
+          type: 'client:data_response',
+          serialNumber: targetESP32,
+          data: {
+            ...chunkData,
+            requestId: syntheticRequestId
+          },
+          requestId: syntheticRequestId,
+          cached: true,
+          timestamp: new Date().toISOString()
+        });
+      }
+    });
+
+    return syntheticRequestId;
+  }
+
+  async handleDataRequestCommand(targetESP32, parameters, clientId) {
+    return this.executeCoalescedReadCommand(targetESP32, 'request_all_data', clientId);
+  }
+
+  async handleReadOnlyDataRequestCommand(targetESP32, parameters, clientId) {
+    return this.executeCoalescedReadCommand(targetESP32, 'request_readonly_data', clientId);
+  }
+
+  async executeCoalescedReadCommand(targetESP32, commandType, clientId) {
     const esp32Socket = this.esp32Handler.getDeviceSocket(targetESP32);
     
     if (!esp32Socket) {
       return { success: false, error: 'ESP32 socket not available' };
     }
 
-    // Generate unique request ID and track the request
-    const requestId = `${clientId}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
-    
-    // Store request tracking info
-    this.pendingDataRequests.set(requestId, {
-      clientId,
-      requestTime: Date.now(),
-      targetESP32
-    });
-
     // Clean up old requests (timeout cleanup)
     this.cleanupExpiredRequests();
 
-    // Request immediate data using ESP32Handler's sendMessage
+    const cacheKey = `${targetESP32}:${commandType}`;
+    const now = Date.now();
+
+    // 1. Check short-TTL server cache first
+    const cached = this.dataCache.get(cacheKey);
+    if (cached && (now - cached.timestamp < this.cacheTtlMs) && cached.chunks.length > 0) {
+      const cachedReqId = this.serveCachedDataToClient(clientId, targetESP32, cached);
+      if (cachedReqId) {
+        logger.debug(`Serving cached ${commandType} for ${targetESP32} to client ${clientId}`);
+        return {
+          success: true,
+          message: 'Data served from server cache',
+          requestId: cachedReqId,
+          cached: true
+        };
+      }
+    }
+
+    // 2. Check if an identical read request is already in-flight to this ESP32
+    const existingRequestId = this.inFlightReadRequests.get(cacheKey);
+    if (existingRequestId && this.pendingDataRequests.has(existingRequestId)) {
+      const pendingReq = this.pendingDataRequests.get(existingRequestId);
+      pendingReq.clientIds.add(clientId);
+
+      // If some chunks have already arrived for this in-flight request, replay them to the newly joined client
+      if (pendingReq.accumulatedChunks.length > 0) {
+        const client = this.connectedClients.get(clientId);
+        if (client && client.socket.readyState === 1) {
+          const chunksToReplay = [...pendingReq.accumulatedChunks];
+          setImmediate(() => {
+            if (client.socket.readyState !== 1) return;
+            for (const chunkData of chunksToReplay) {
+              this.sendMessage(client.socket, {
+                type: 'client:data_response',
+                serialNumber: targetESP32,
+                data: chunkData,
+                requestId: existingRequestId,
+                timestamp: new Date().toISOString()
+              });
+            }
+          });
+        }
+      }
+
+      logger.debug(`Coalesced ${commandType} request from client ${clientId} into in-flight request ${existingRequestId}`);
+      return {
+        success: true,
+        message: 'Joined in-flight data request to ESP32',
+        requestId: existingRequestId,
+        coalesced: true
+      };
+    }
+
+    // 3. No valid cache and no in-flight request: send a new command to ESP32
+    const requestId = `${clientId}_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
+    
+    this.pendingDataRequests.set(requestId, {
+      clientId,
+      clientIds: new Set([clientId]),
+      requestTime: now,
+      targetESP32,
+      commandType,
+      cacheKey,
+      accumulatedChunks: []
+    });
+    this.inFlightReadRequests.set(cacheKey, requestId);
+
     this.esp32Handler.sendMessage(esp32Socket, {
       type: 'esp32:command',
-      command: 'request_readonly_data',
-      // immediate: true,
+      command: commandType,
       requestId: requestId,
       timestamp: new Date().toISOString()
     });
@@ -646,39 +714,90 @@ class ClientHandler {
     return client ? Array.from(client.subscriptions) : [];
   }
 
+  // Broadcast generic message (status, command_response, ota_status) to subscribers of a specific ESP32
+  broadcastMessageToSubscribers(serialNumber, message) {
+    for (const [, client] of this.connectedClients.entries()) {
+      if (client.subscriptions.has(serialNumber) && client.socket.readyState === 1) {
+        this.sendMessage(client.socket, message);
+      }
+    }
+  }
+
+  // Finalize a chunked request (used when the final chunk itself had empty data)
+  completeChunkedRequest(requestId, serialNumber) {
+    if (!requestId || !this.pendingDataRequests.has(requestId)) return;
+    const request = this.pendingDataRequests.get(requestId);
+
+    if (request.cacheKey) {
+      this.inFlightReadRequests.delete(request.cacheKey);
+      if (request.accumulatedChunks && request.accumulatedChunks.length > 0) {
+        this.dataCache.set(request.cacheKey, {
+          timestamp: Date.now(),
+          chunks: request.accumulatedChunks
+        });
+      }
+    }
+
+    this.pendingDataRequests.delete(requestId);
+  }
+
   // Broadcast methods (called by ESP32Handler)
   broadcastToSubscribers(serialNumber, data) {
     // Check if this is a response to a specific data request
     if (data.requestId && this.pendingDataRequests.has(data.requestId)) {
-      // This is a response to a specific client request
       const request = this.pendingDataRequests.get(data.requestId);
-      const client = this.connectedClients.get(request.clientId);
-      
-      if (client && client.socket.readyState === 1) {
-        let messageType = 'client:data_response';
-        
-        // Determine response type based on request type
-        if (request.commandType === 'write_register') {
-          messageType = 'client:write_response';
-        } else if (request.commandType === 'write_multiple_registers') {
-          messageType = 'client:write_multiple_response';
-        }
-        
-        this.sendMessage(client.socket, {
-          type: messageType,
-          serialNumber,
-          data,
-          requestId: data.requestId,
-          timestamp: new Date().toISOString()
-        });
-        
+      let messageType = 'client:data_response';
+
+      // Determine response type based on request type
+      if (request.commandType === 'write_register') {
+        messageType = 'client:write_response';
+      } else if (request.commandType === 'write_multiple_registers') {
+        messageType = 'client:write_multiple_response';
       }
-      
-      // Clean up the request
-      this.pendingDataRequests.delete(data.requestId);
+
+      const recipientIds = request.clientIds ? Array.from(request.clientIds) : [request.clientId];
+      const payload = {
+        type: messageType,
+        serialNumber,
+        data,
+        requestId: data.requestId,
+        timestamp: new Date().toISOString()
+      };
+
+      for (const recipientId of recipientIds) {
+        const client = this.connectedClients.get(recipientId);
+        if (client && client.socket.readyState === 1) {
+          this.sendMessage(client.socket, payload);
+        }
+      }
+
+      // Track chunks for caching & late-joining coalesced clients
+      if (request.accumulatedChunks) {
+        request.accumulatedChunks.push(data);
+      }
+
+      // Check whether this is a multi-chunk stream that still has more chunks coming
+      const isChunked = typeof data.chunk_number === 'number' && typeof data.total_chunks === 'number';
+      const isFinalChunk = !isChunked || data.is_final_chunk === true || data.chunk_number >= data.total_chunks;
+
+      if (isFinalChunk) {
+        if (request.cacheKey) {
+          this.inFlightReadRequests.delete(request.cacheKey);
+          if (request.accumulatedChunks && request.accumulatedChunks.length > 0) {
+            this.dataCache.set(request.cacheKey, {
+              timestamp: Date.now(),
+              chunks: request.accumulatedChunks
+            });
+          }
+        }
+        this.pendingDataRequests.delete(data.requestId);
+      } else {
+        // Refresh timeout while chunks are actively streaming
+        request.requestTime = Date.now();
+      }
     } else {
       // This is regular periodic sensor data - broadcast to all subscribers
-      for (const [clientId, client] of this.connectedClients.entries()) {
+      for (const [, client] of this.connectedClients.entries()) {
         if (client.subscriptions.has(serialNumber) && client.socket.readyState === 1) {
           this.sendMessage(client.socket, {
             type: 'esp32:data_broadcast',
@@ -696,6 +815,9 @@ class ClientHandler {
     const now = Date.now();
     for (const [requestId, request] of this.pendingDataRequests.entries()) {
       if (now - request.requestTime > this.requestTimeout) {
+        if (request.cacheKey && this.inFlightReadRequests.get(request.cacheKey) === requestId) {
+          this.inFlightReadRequests.delete(request.cacheKey);
+        }
         this.pendingDataRequests.delete(requestId);
       }
     }

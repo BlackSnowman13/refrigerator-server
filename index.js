@@ -27,7 +27,24 @@ class RefrigeratorServer {
     this.app.use(express.json());
     
     this.server = createServer(this.app);
-    this.wss = new WebSocket.Server({ server: this.server });
+    this.wss = new WebSocket.Server({
+      server: this.server,
+      perMessageDeflate: {
+        zlibDeflateOptions: {
+          chunkSize: 1024,
+          memLevel: 7,
+          level: 3
+        },
+        zlibInflateOptions: {
+          chunkSize: 10 * 1024
+        },
+        clientNoContextTakeover: true,
+        serverNoContextTakeover: true,
+        serverMaxWindowBits: 10,
+        concurrencyLimit: 10,
+        threshold: 128 // Only compress messages larger than 128 bytes
+      }
+    });
     this.port = process.env.PORT || 3000;
     
     // Ping/pong heartbeat interval (30 seconds)
