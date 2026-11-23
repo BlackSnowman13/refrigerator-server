@@ -11,6 +11,7 @@ const ESP32Handler = require('./src/handlers/esp32Handler');
 const ClientHandler = require('./src/handlers/clientHandler');
 const otaService = require('./src/utils/otaService');
 const logger = require('./src/utils/logger');
+const V1Server = require('./src/v1');
 
 class RefrigeratorServer {
   constructor() {
@@ -28,7 +29,7 @@ class RefrigeratorServer {
     
     this.server = createServer(this.app);
     this.wss = new WebSocket.Server({
-      server: this.server,
+      noServer: true,
       perMessageDeflate: {
         zlibDeflateOptions: {
           chunkSize: 1024,
@@ -56,9 +57,15 @@ class RefrigeratorServer {
     
     // Set cross-references so handlers can communicate
     this.esp32Handler.setClientHandler(this.clientHandler);
+
+    // Initialize v1 WebSocket server (routed on /v1)
+    this.v1Server = new V1Server({
+      legacyEsp32Handler: this.esp32Handler
+    });
     
     this.setupRoutes();
     this.setupSocketHandlers();
+    this.setupUpgradeRouter();
     this.startPingInterval();
   }
 
@@ -70,7 +77,8 @@ class RefrigeratorServer {
         status: 'running',
         timestamp: new Date().toISOString(),
         connectedESP32s: this.esp32Handler.getConnectedDevicesCount(),
-        connectedClients: this.clientHandler.getConnectedClientsCount()
+        connectedClients: this.clientHandler.getConnectedClientsCount(),
+        v1: this.v1Server.getStats()
       });
     });
 
@@ -185,6 +193,26 @@ class RefrigeratorServer {
     });
   }
 
+  setupUpgradeRouter() {
+    this.server.on('upgrade', (request, socket, head) => {
+      let pathname = '/';
+      try {
+        pathname = new URL(request.url, `http://${request.headers.host || 'localhost'}`).pathname;
+      } catch (_) {
+        pathname = (request.url || '/').split('?')[0];
+      }
+
+      if (pathname === '/v1' || pathname === '/v1/') {
+        this.v1Server.handleUpgrade(request, socket, head);
+      } else {
+        // Default: route "/" and any other legacy path to existing unversioned WebSocket server
+        this.wss.handleUpgrade(request, socket, head, (ws) => {
+          this.wss.emit('connection', ws, request);
+        });
+      }
+    });
+  }
+
   startPingInterval() {
     setInterval(() => {
       this.wss.clients.forEach((ws) => {
@@ -238,6 +266,9 @@ class RefrigeratorServer {
       // Initialize database
       await this.database.initialize();
       logger.info('Database initialized successfully');
+
+      // Initialize v1 server
+      await this.v1Server.initialize();
 
       // Start server
       this.server.listen(this.port, () => {

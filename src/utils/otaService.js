@@ -114,6 +114,48 @@ class OTAService {
     };
   }
 
+  /**
+   * Resolve the temporary pre-signed HTTPS download URL (302 Location from GitHub Releases Asset API)
+   * so an ESP32 can download the firmware binary directly without a GitHub token.
+   */
+  async resolvePreSignedDownloadUrl(forceRefresh = false) {
+    const latest = await this.getLatestRelease(forceRefresh);
+    if (!latest.asset) {
+      throw new Error('No .bin firmware asset found in latest GitHub release');
+    }
+
+    const repo = process.env.GITHUB_REPO || this.repo;
+    const assetApiUrl = `https://api.github.com/repos/${repo}/releases/assets/${latest.asset.id}`;
+
+    const downloadUrl = await new Promise((resolve, reject) => {
+      const req = https.get(
+        assetApiUrl,
+        { headers: this.getHeaders('application/octet-stream', true) },
+        (res) => {
+          res.resume();
+          if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            resolve(res.headers.location);
+          } else if (res.statusCode === 200) {
+            // Public asset without redirect
+            resolve(assetApiUrl);
+          } else {
+            reject(new Error(`Failed to resolve GitHub asset redirect (HTTP ${res.statusCode})`));
+          }
+        }
+      );
+      req.on('error', reject);
+      req.setTimeout(15000, () => {
+        req.destroy(new Error('GitHub asset redirect request timeout'));
+      });
+    });
+
+    return {
+      version: latest.tagName,
+      downloadUrl,
+      assetSize: latest.asset.size
+    };
+  }
+
   async streamLatestBinary(res) {
     const latest = await this.getLatestRelease(true);
     if (!latest.asset) {
